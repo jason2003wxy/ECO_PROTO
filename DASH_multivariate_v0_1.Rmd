@@ -1,0 +1,696 @@
+---
+title: "ESG Mock"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    # vertical_layout: fill
+    # vertical_layout: scroll
+    # social: menu
+    # source_code: embed
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+rm(list = ls())
+### load prepare the data or source them from data dictioanry
+load("DATA/usEcoData2Test.Rdata")
+######source("CODE/0_collect_prepare_data.R")
+######source("CODE/0_collect_prepare_CSV.R")
+library(dplyr)
+library(tidyr)
+library(vars)
+library(ggplot2)
+library(plotly)
+library(flexdashboard)
+source("CODE/fun_generic.R")
+```
+
+
+Multivariate Time Series
+=======================================================================
+
+Inputs {.sidebar}
+-----------------------------------------------------------------------
+
+```{r}
+checkboxGroupInput('sel.var.VAR.mod', label = h5("Variable chosen to VAR"),
+                           names(lst.eco), selected = names(lst.eco)[grepl("GDP", names(lst.eco))])
+### ***2DO following start date and end date should be linked with the chosen variable
+dateRangeInput("sel.time.train", label = h5("Traning sample date range"),
+      start = "1995-01-01", end = "2013-12-31")
+### type of difference 
+selectInput("delta.sel.VAR", label = h5(paste0("Type of difference / delta")),
+  choices = list("as-is"="asis", "abs diff rates; log diff rest"="diffLogAbs", 
+                 "log difference"="diffLog", "absolute difference"="diffAbs"), #"% return"="diffRelat", 
+  selected = "diffLogAbs")
+### type of value to VAR(p)
+selectInput("data2Fit.sel.VAR", label = paste0("Type of value for VAR(p) model fit"),
+  choices = list("Original values"="valOriginal", "Adjusted values based chosen delta (log value if log diff)"="valAjusted", 
+                 "Delta value directly"="valDelta"), selected = "valAjusted")
+### lag for VAR(p) model fitting
+sliderInput(inputId = "sel.VAR.lag", label = "p parameter: lag of VAR(p)", min = 0, max = 10, value = 1)
+### ***2DO how to interacte training sample date range
+dateRangeInput("sel.time.test", label = h5("Testing sample date range"),
+      start = "2013-12-31", end = as.character(Sys.Date()))
+```
+
+
+
+```{r}
+#############################BEGIN: Prepare Reactive Data #############################################
+## select economic variables
+namVarb.VAR <- reactive({
+  as.character(input$sel.var.VAR.mod)
+})
+## date range for training sample
+date.range.train <- reactive({
+  data.frame(dateBeg=as.Date(input$sel.time.train[1]), dateEnd=as.Date(input$sel.time.train[2]), 
+             stringsAsFactors=FALSE)
+})
+## date range for testing sample
+date.range.test <- reactive({
+  data.frame(dateBeg=as.Date(input$sel.time.test[1]), dateEnd=as.Date(input$sel.time.test[2]), 
+             stringsAsFactors=FALSE)
+})
+## full sample according to the selected economic variables
+df.full.sample.VAR <- reactive({
+  Check.Unique(namVarb.VAR())
+  Check.StopIf(length(setdiff(namVarb.VAR(), names(lst.eco)))!=0, 
+               "The selected variables cannot be found in the data list. Check dict.data!!!")
+  if(length(namVarb.VAR()) > 1){
+    pos.eco <- which(names(lst.eco) %in% namVarb.VAR())
+    ##### 1st: find the common dates across chosen economic variables!
+    date.comm <- as.Date(intersect(lst.eco[[pos.eco[1]]]$date, lst.eco[[pos.eco[2]]]$date), 
+                         origin="1970-01-01")
+    if (length(pos.eco) > 2){
+      for (idx in 3:length(pos.eco)){
+        date.comm <- as.Date(intersect(date.comm, lst.eco[[pos.eco[idx]]]$date), origin="1970-01-01")
+      }
+    }
+    tmp <- data.frame(date=date.comm, stringsAsFactors=FALSE)
+    for (idx in pos.eco){
+      eval(parse(text=paste0(
+      "tmp$", names(lst.eco)[idx], " <- as.numeric(lst.eco[[", idx, 
+          "]]$value[match(date.comm, lst.eco[[", idx,"]]$date)])"
+      )))
+    }
+    tmp
+  } else{
+    stop("Must choose at least two economic variables!!!")
+  }
+})
+## delta's of the full sample
+df.full.sample.delta.VAR <- reactive({
+  tmp <- df.full.sample.VAR()
+  Check.Unique(tmp$date)
+  Check.StopIf(sum(is.na(tmp$value))>0, "Currently, we cannot handle NA in the eco variable!")
+  if (!identical(sort(tmp$date), tmp$date)){
+    tmp <- tmp[match(sort(tmp$date), tmp$date), ]
+  }
+  posNonDate <- which(names(tmp) != "date")
+  ### proced to calculate deltas
+  if(input$delta.sel.VAR == "asis"){
+    res <- tmp
+  } else if (input$delta.sel.VAR == "diffLog"){
+    res <- tmp[-1, ]
+    res[, posNonDate] <- log(tmp[-1, posNonDate]) - log(head(tmp[, posNonDate], dim(tmp)[1]-1))
+  } else if (input$delta.sel.VAR == "diffRelat"){
+    res <- tmp[-1, ]
+    res[, posNonDate] <- tmp[-1, posNonDate] / head(tmp[, posNonDate], dim(tmp)[1]-1) -1
+  } else if (input$delta.sel.VAR == "diffAbs"){
+    res <- tmp[-1, ]
+    res[, posNonDate] <- tmp[-1, posNonDate] - head(tmp[, posNonDate], dim(tmp)[1]-1)
+  } else if (input$delta.sel.VAR == "diffLogAbs") {
+    res <- tmp[-1, ]
+    ### 2DO: QUICK-FIX: we take absoluteDiff for variable name contains "rate"
+    ### we take logDiff for variable for variable name does not contain "rate"
+    ixRate <- grepl("rate.", names(tmp), ignore.case=T)
+    ixNonRest <- (!grepl("rate.", names(tmp), ignore.case=T)) & (names(tmp) != "date")
+    if (sum(ixRate) > 0) {
+      res[, ixRate] <- tmp[-1, ixRate] - head(tmp[, ixRate], dim(tmp)[1]-1)
+    }
+    if (sum(ixNonRest) > 0) {
+      res[, ixNonRest] <- log(tmp[-1, ixNonRest]) - log(head(tmp[, ixNonRest], dim(tmp)[1]-1))
+    }
+  } else {
+    stop("The chosen delta is not defined. Extend code here!")
+  }
+  res
+})
+
+## traning sample according to the selected economic variables
+df.train.sample.VAR <- reactive({
+  tmp <- df.full.sample.VAR()
+  Check.ExistVarInDF(tmp, "date")
+  filter(tmp, date >= max(date.range.train()$dateBeg, min(tmp$date)),
+         date <= min(date.range.train()$dateEnd, max(tmp$date)))
+})
+### traning sample aligned value (for non-rate variables, set all value starting at 100!)
+df.train.sample.alignedVal.VAR <- reactive({
+  tmp <- df.train.sample.VAR()
+  res <- tmp
+  ixNonRest <- (!grepl("rate.", names(tmp), ignore.case=T)) & (names(tmp) != "date")
+  if (sum(ixNonRest) > 0){
+    res[1, ixNonRest] <- 100
+    tmpRet <- tmp[-1, ixNonRest] / head(tmp[, ixNonRest], dim(tmp)[1]-1) -1
+    res[-1, ixNonRest] <- apply(tmpRet + 1, 2, cumprod) * 100
+  } 
+  # ixRate <- grepl("rate.", names(tmp), ignore.case=T)
+  # if ( sum(ixRate) > 0 ) {
+  #   res[1, ixRate] <- 100
+  #   tmpRet <- tmp[-1, ixRate] - head(tmp[, ixRate], dim(tmp)[1]-1)
+  #   res[-1, ixRate] <- apply(tmpRet, 2, cumsum) + 100
+  # } 
+  res
+})
+## traning sample DELTA according to the selected economic variables
+df.train.sample.delta.VAR <- reactive({
+  tmp <- df.full.sample.delta.VAR()
+  filter(tmp, date > min(df.train.sample.VAR()[, 1]),
+         date <= max(df.train.sample.VAR()[, 1]))
+})
+## training data for VAR(p) model fit
+df.train.data2VAR.fit <- reactive({
+  if (input$data2Fit.sel.VAR == "valOriginal"){
+    res <- df.train.sample.VAR()
+  } else if (input$data2Fit.sel.VAR == "valDelta"){
+    res <- df.train.sample.delta.VAR()
+  } else if (input$data2Fit.sel.VAR == "valAjusted") {
+    tmp <- df.train.sample.VAR()
+    if (sum(input$delta.sel.VAR %in% c("asis", "diffAbs"))==1) {
+      res <- tmp
+    } else if (input$delta.sel.VAR == "diffLogAbs") {
+      ixNonRest <- (!grepl("rate.", names(tmp), ignore.case=T)) & (names(tmp) != "date")
+      res <- tmp
+      res[, ixNonRest] <- log(res[, ixNonRest])
+    } else if (input$delta.sel.VAR == "diffLog") {
+      res <- tmp
+      res[, names(tmp) != "date"] <- log(tmp[, names(tmp) != "date"])
+    } else{
+      stop("It is not defined here!!!")
+    }
+  } else {
+    stop("Expand code for this case!!!")
+  }
+  res 
+})
+### US Recession stress period for training sample
+df.UsRecess.train.VAR <- reactive({
+  tmp <- df.train.data2VAR.fit()$date
+  filter(dateUsRecess, monBeg >= min(tmp), monEnd <= max(tmp))
+})
+## testing sample according to the selected economic variables
+df.test.sample.VAR <- reactive({
+  tmp <- df.full.sample.VAR()
+  Check.ExistVarInDF(tmp, "date")
+  filter(tmp, date >= max(date.range.test()$dateBeg, min(tmp$date)),
+         date <= min(date.range.test()$dateEnd, max(tmp$date)))
+})
+## testing sample DELTA according to the selected economic variables
+df.test.sample.delta.VAR <- reactive({
+  tmp <- df.full.sample.delta.VAR()
+  filter(tmp, date > min(df.test.sample.VAR()[, 1]),
+         date <= max(df.test.sample.VAR()[, 1]))
+})
+## testing data for VAR(p) model forecast
+df.test.data2VAR.fit <- reactive({
+  if (input$data2Fit.sel.VAR == "valOriginal"){
+    res <- df.test.sample.VAR()
+  } else if (input$data2Fit.sel.VAR == "valDelta"){
+    res <- df.test.sample.delta.VAR()
+  } else if (input$data2Fit.sel.VAR == "valAjusted") {
+    tmp <- df.test.sample.VAR()
+    if (sum(input$delta.sel.VAR %in% c("asis", "diffAbs"))==1) {
+      res <- tmp
+    } else if (input$delta.sel.VAR == "diffLogAbs") {
+      ixNonRest <- (!grepl("rate.", names(tmp), ignore.case=T)) & (names(tmp) != "date")
+      res <- tmp
+      res[, ixNonRest] <- log(res[, ixNonRest])
+    } else if (input$delta.sel.VAR == "diffLog") {
+      res <- tmp
+      res[, names(tmp) != "date"] <- log(tmp[, names(tmp) != "date"])
+    } else{
+      stop("It is not defined here!!!")
+    }
+  } else {
+    stop("Expand code for this case!!!")
+  }
+  res
+})
+df.test.sample.alignedVal.VAR <- reactive({
+  tmp <- df.test.sample.VAR()
+  res <- tmp
+  ixNonRest <- (!grepl("rate.", names(tmp), ignore.case=T)) & (names(tmp) != "date")
+  if (sum(ixNonRest) > 0){
+    res[1, ixNonRest] <- 100
+    tmpRet <- tmp[-1, ixNonRest] / head(tmp[, ixNonRest], dim(tmp)[1]-1) -1
+    res[-1, ixNonRest] <- apply(tmpRet + 1, 2, cumprod) * 100
+  } 
+  res
+})
+### US Recession stress period for test sample
+df.UsRecess.test.VAR <- reactive({
+  tmp <- df.test.data2VAR.fit()$date
+  filter(dateUsRecess, monBeg >= min(tmp), monEnd <= max(tmp))
+})
+################################################################END: reactive data prepare####
+
+#################################BEGIN: reactive ANALYSES##################################
+################################################################END: reactive ANALYSES#####
+
+
+#################################BEGIN: Reactive model fitting #################################
+### model fit for optimal lag
+mod.VAR.algo <- reactive({
+  VARselect(df.train.data2VAR.fit()[, names(df.train.data2VAR.fit()) != "date"], lag.max = 12, type = "both")
+})
+### VAR model fit
+mod.VAR.select <- reactive({
+  VAR(df.train.data2VAR.fit()[, names(df.train.data2VAR.fit()) != "date"], 
+            p=as.numeric(input$sel.VAR.lag), type = "both")
+})
+### VAR model parameters
+
+lst.modEst.VAR.select <- reactive({
+  tmp <- summary(mod.VAR.select())
+  nam <- names(tmp$varresult)
+  tab.est <- data.frame(tmp$varresult[[1]]$coefficients[, 1], stringsAsFactors=F)
+  tab.pVal <- data.frame(tmp$varresult[[1]]$coefficients[, 4], stringsAsFactors=F)
+  vec.resid.sigma <- tmp$varresult[[1]]$sigma
+  if(length(nam)>1){
+    for (idx in 2:length(nam)){
+      tmpDf <- data.frame(tmp$varresult[[idx]]$coefficients[, c(1, 4)], stringsAsFactors=F)
+      tab.est <- cbind(tab.est, tmpDf[, 1])
+      tab.pVal <- cbind(tab.pVal, tmpDf[, 2])
+      vec.resid.sigma <- c(vec.resid.sigma, tmp$varresult[[idx]]$sigma)
+    }
+  }
+  tab.est <- data.frame(tab.est, stringsAsFactors = F)
+  tab.pVal <- data.frame(tab.pVal, stringsAsFactors = F)
+  names(tab.est) <- nam
+  names(tab.pVal) <- nam
+  mat.cov <- tmp$covres
+  mat.corr <- tmp$corres
+  colnames(mat.cov) <- nam
+  colnames(mat.corr) <- nam
+  row.names(mat.cov) <- nam
+  row.names(mat.corr) <- nam
+  vec.eigen <- tmp$roots
+  list(df.est=tab.est, df.est.pVal=tab.pVal, vec.sigma.stdErr=vec.resid.sigma, 
+       vec.eigen=vec.eigen, mat.cov=mat.cov, mat.corr=mat.corr)
+})
+
+
+## VAR forecast for the input value
+df.VAR.forecast.modOut <- reactive({
+  tmp <- predict(mod.VAR.select(), n.ahead = dim(df.test.data2VAR.fit())[1])
+  namVar <- names(tmp$fcst)
+  df.pred <- data.frame(tmp$fcst[[1]][, 1:3], stringsAsFactors=FALSE)
+  names(df.pred) <- paste0(namVar[1], c("_predict", "_LowerB", "_UpperB"))
+  if (length(namVar) > 1) {
+   for(idx in 2:length(namVar)){
+     tst <- data.frame(tmp$fcst[[idx]][, 1:3], stringsAsFactors=FALSE)
+     names(tst) <- paste0(namVar[idx], c("_predict", "_LowerB", "_UpperB"))
+     df.pred <- cbind(df.pred, tst)
+   }
+  }
+  df.pred
+})
+### combine the model forecast with the training sample (scale: VAR.fit, i.e., log value for delta of log diff)
+df.VAR.forecast.val2VAR <- reactive({
+  df.real <- df.test.data2VAR.fit()
+  ### attached to the training sample for comparison
+  df2Use <- df.test.data2VAR.fit()
+  names(df2Use) <- c("date", paste0(names(df.real)[names(df.real) != "date"], "_value"))
+  df2Use <- cbind(df2Use, df.VAR.forecast.modOut())
+  df2Use
+})
+################################################################END: Reactive model fitting#####
+```
+
+Column {.tabset .tabset-fade .tabset-pills}
+-----------------------------------------------------------------------
+### Selected variables
+#### Value of chosen variable
+```{r}
+DT::renderDataTable({
+  df.train.sample.VAR()
+  }, options = list(pageLength = 3, autoWidth = TRUE, rownames= FALSE)
+)
+```
+
+#### $\Delta$ of chosen variable
+```{r}
+DT::renderDataTable({
+  df.train.sample.delta.VAR()
+  }, options = list(pageLength = 3, autoWidth = TRUE, rownames= FALSE)
+)
+```
+
+#### Values used to fit VAR(p) model
+```{r}
+DT::renderDataTable({
+  df.train.data2VAR.fit()
+  }, options = list(pageLength = 3, autoWidth = TRUE, rownames= FALSE)
+)
+```
+
+
+### Plot of time series 
+- Plot of value over time 
+```{r}
+renderPlot({
+  tmp <- df.train.data2VAR.fit()
+  namDf <- names(tmp)[names(tmp) != "date"]
+  eval(parse(text=paste0(
+  "df2Plot <- tmp %>%",
+    "gather(measure, value,", namDf[1], ":", tail(namDf, 1), ")"
+  )))
+  gObj <- ggplot(data=df2Plot) +
+  geom_line(aes(x=date,y=value, group=measure), col="blue") +
+  geom_point(aes(x=date,y=value, group=measure)) +
+  facet_wrap(~measure, scales="free")
+  if (nrow(df.UsRecess.train.VAR())==0) {
+    gObj
+  } else{
+    gObj + geom_rect(data=df.UsRecess.train.VAR(),
+            aes(xmin=monBeg, xmax=monEnd, ymin=-Inf, ymax=+Inf), fill='red', alpha=0.2)
+  }
+})
+```
+
+- Plot of $\Delta$ over time
+```{r}
+renderPlot({
+  tmp <- df.train.sample.delta.VAR()
+  namDf <- names(tmp)[names(tmp) != "date"]
+  eval(parse(text=paste0(
+  "df2Plot <- tmp %>%",
+    "gather(measure, value,", namDf[1], ":", tail(namDf, 1), ")"
+  )))
+  gObj <- ggplot(data=df2Plot) +
+  geom_line(aes(x=date,y=value, group=measure), col="blue") +
+  geom_point(aes(x=date,y=value, group=measure)) +
+  facet_wrap(~measure, scales="free")
+  if (nrow(df.UsRecess.train.VAR())==0) {
+    gObj
+  } else{
+    gObj + geom_rect(data=df.UsRecess.train.VAR(),
+            aes(xmin=monBeg, xmax=monEnd, ymin=-Inf, ymax=+Inf), fill='red', alpha=0.2)
+  }
+})
+```
+
+
+### Stationary test
+#### Stationarity test on the chosen variable and its **$\Delta$**
+
+- [ADF](https://en.wikipedia.org/wiki/Augmented_Dickey%E2%80%93Fuller_test) test ($H_0$ of unit root presence, i.e.,  $I(1)$ process vs. $H_A$ stationary)
+
+- [PP](https://en.wikipedia.org/wiki/Augmented_Dickey%E2%80%93Fuller_test) test ($H_0$ of unit root presence, i.e.,  $I(1)$ process v.s., $H_A$ stationary)
+
+- [KPSS](https://en.wikipedia.org/wiki/KPSS_test) test ($H_0$ of stationary or $I(0)$ process v.s. $H_A$ non-stationary): 
+This test can be performed assuming the deterministic component of the variable is a constant or a constant with a linear trend.
+
+#### Test conclusions
+```{r}
+DT::renderDataTable({
+  tmp <- df.train.sample.VAR()
+  res.val <- TestsStationaryPval(tmp[, names(tmp) != "date"], k=2)
+  tmp <- df.train.sample.delta.VAR()
+  res.delta <- TestsStationaryPval(tmp[, names(tmp) != "date"], k=2)
+  res.pVal <- cbind(res.val, res.delta)
+  res.con <- apply(res.pVal, 2, function(x) ifelse(x < 0.05, "Stationary", "Non-stationary"))
+  res.conKpss <- apply(res.pVal, 2, function(x) ifelse(x < 0.05, "Non-stationary", "Stationary"))
+  res.con[, grepl("KPSS", colnames(res.con), ignore.case=T)] <- res.conKpss[, grepl("KPSS", colnames(res.con), ignore.case=T)]
+  colnames(res.con) <- c("Value: ADF", "Value: PP", "Value: KPSS (trend)", "Value: KPSS (level)", 
+                       "Delta: ADF", "Delta: PP", "Delta: KPSS (trend)", "Delta: KPSS (level)")
+  row.names(res.con) <- names(tmp)[-1]
+  res.con
+  }, options = list(pageLength = 3, autoWidth = TRUE)
+)  
+```
+
+#### Test p-values
+``` {r}
+DT::renderDataTable({
+  tmp <- df.train.sample.VAR()
+  res.val <- TestsStationaryPval(tmp[, names(tmp) != "date"], k=2)
+  tmp <- df.train.sample.delta.VAR()
+  res.delta <- TestsStationaryPval(tmp[, names(tmp) != "date"], k=2)
+  res.pVal <- apply(cbind(res.val, res.delta), 2, function(x) round(x, 3))
+  colnames(res.pVal) <- c("Value: ADF", "Value: PP", "Value: KPSS (trend)", "Value: KPSS (level)", 
+                       "Delta: ADF", "Delta: PP", "Delta: KPSS (trend)", "Delta: KPSS (level)")
+  row.names(res.pVal) <- names(tmp)[-1]
+  res.pVal
+  }, options = list(pageLength = 3, autoWidth = TRUE)
+)  
+```
+
+#### Are the chosen time series $I(1)$?
+If so, we can proceed to VAR fit 
+
+
+
+### VAR Model
+- Optimal lag of VAR(p) by statistical criteria
+```{r}
+renderPrint({
+  tmp <- data.frame(t(as.numeric(mod.VAR.algo()$selection)), stringsAsFactors = F)
+  names(tmp) <- names(mod.VAR.algo()$selection)
+  tmp
+})
+```
+
+- VAR(p) model fit given chosen p value
+```{r}
+DT::renderDataTable({
+  tmp <- lst.modEst.VAR.select()
+  tab2Show <- paste0(round(tmp$df.est[, 1], 2), " (", round(tmp$df.est.pVal[, 1], 3),")")
+  if (dim(tmp$df.est)[2] > 1){
+    for (idx in 2:dim(tmp$df.est)[2]){
+     tab2Show <- cbind(tab2Show, paste0(round(tmp$df.est[, idx], 2), " (", round(tmp$df.est.pVal[, idx], 3),")"))
+    }
+  }
+  tab2Show <- data.frame(tab2Show, stringsAsFactors = F)
+  names(tab2Show) <- paste0(names(tmp$df.est), ": Est.(pVal)")
+  row.names(tab2Show) <- row.names(tmp$df.est)
+  tab2Show
+}, options = list(pageLength = 3, autoWidth = TRUE)
+)
+```
+
+- Correlation matrix of model residuals
+```{r}
+DT::renderDataTable({
+  tmp <- summary(mod.VAR.select())
+  round(tmp$corres, 3)
+}, options = list(pageLength = 2, autoWidth = TRUE)
+)
+```
+
+- Causality test: Please note that the test is to determine whether one time series is useful in forecasting another.
+```{r}
+DT::renderDataTable({
+  tmp <- mod.VAR.select()
+  namVar <- colnames(tmp$y)
+  res <- causality(tmp, cause=namVar[1])
+  tab2Show <- data.frame(pVal.gran=round(as.numeric(res$Granger$p.value), 3), h0.gran=res$Granger$method, 
+                         pVal.inst=round(as.numeric(res$Instant$p.value), 3), h0.inst=res$Instant$method, stringsAsFactors=FALSE)
+  if (length(namVar) > 1){
+    for (idx in 2:length(namVar)){
+      res <- causality(tmp, cause=namVar[idx])
+      tab2Show <- rbind(tab2Show, data.frame(pVal.gran=round(as.numeric(res$Granger$p.value), 3), h0.gran=res$Granger$method, 
+                                             pVal.inst=round(as.numeric(res$Instant$p.value), 3), h0.inst=res$Instant$method, stringsAsFactors=FALSE))
+    }
+  }
+  names(tab2Show) <- c("Granger p-value", "Granger Null hypothesis", "Instant p-value", "Instant Null hypothesis")
+  tab2Show
+  }, options = list(pageLength = 1, autoWidth = TRUE)
+)
+```
+
+
+### Model Historical fit
+```{r}
+renderPlot({
+  tmp <- mod.VAR.select()
+  namVar <- colnames(tmp$y)
+  df.Y <- data.frame(tmp$y, stringsAsFactors = F)
+  df.Y$date <- df.train.data2VAR.fit()$date
+  df.Y <- df.Y[, match(c("date", namVar), names(df.Y))]
+  df.Y.fitted <- data.frame(tmp$varresult[[1]]$fitted.values, stringsAsFactors = F)
+  if (length(namVar) > 1){
+    for (idx in 2:length(namVar)){
+      df.Y.fitted <- cbind(df.Y.fitted,
+                           data.frame(tmp$varresult[[idx]]$fitted.values, stringsAsFactors = F))
+    }
+  }
+  names(df.Y.fitted) <- namVar
+  df.Y.fitted$date <- tail(df.Y$date, dim(df.Y.fitted)[1])
+  df.Y.fitted <- df.Y.fitted[, match(c("date", namVar), names(df.Y.fitted))]
+  eval(parse(text=paste0(
+  "df2Plot.Y <- df.Y %>%",
+    "gather(measure, value,", namVar[1], ":", tail(namVar, 1), ")"
+  )))
+  eval(parse(text=paste0(
+  "df2Plot.Y.fitted <- df.Y.fitted %>%",
+    "gather(measure, value,", namVar[1], ":", tail(namVar, 1), ")"
+  )))
+  gObj <- ggplot(data=df2Plot.Y) +
+    geom_line(aes(x=date, y=value, group=measure), col="blue") +
+    geom_point(aes(x=date, y=value, group=measure)) +
+    facet_wrap(~measure, scales="free")+ 
+    geom_line(data=df2Plot.Y.fitted, aes(x=date, y=value, group=measure)) +
+    geom_line(data=df2Plot.Y.fitted, aes(x=date, y=value, group=measure), col="red") 
+  if (nrow(df.UsRecess.train.VAR())==0) {
+    gObj
+  } else{
+    gObj + geom_rect(data=df.UsRecess.train.VAR(),
+            aes(xmin=monBeg, xmax=monEnd, ymin=-Inf, ymax=+Inf), fill='red', alpha=0.2)
+  }
+})
+```
+
+
+### Residual Tests
+
+- Stationary test for individual residual series
+```{r}
+DT::renderDataTable({
+  tmp <- mod.VAR.select()
+  namVar <- colnames(tmp$y)
+  df.mod.resid <- data.frame(tmp$varresult[[1]]$residuals, stringsAsFactors = F)
+  if (length(namVar > 1)){
+    for (idx in 2:length(namVar)){
+      df.mod.resid <- cbind(df.mod.resid, 
+                           data.frame(tmp$varresult[[idx]]$residuals, stringsAsFactors = F))
+    }
+  }
+  names(df.mod.resid) <- namVar
+  res.pVal <- TestsStationaryPval(df.mod.resid[, names(df.mod.resid) != "date"], k=2)
+  res.con <- apply(res.pVal, 2, function(x) ifelse(x < 0.05, "Stationary", "Non-stationary"))
+  res.conKpss <- apply(res.pVal, 2, function(x) ifelse(x < 0.05, "Non-stationary", "Stationary"))
+  res.con[, grepl("KPSS", colnames(res.con), ignore.case=T)] <- res.conKpss[, grepl("KPSS", colnames(res.con), ignore.case=T)]
+  colnames(res.con) <- c("Resid: ADF", "Resid: PP", "Resid: KPSS (trend)", "Resid: KPSS (level)")
+  row.names(res.con) <- namVar
+  res.con
+  }, options = list(pageLength = 2, autoWidth = TRUE)
+)  
+```
+
+- Residual **Autocorrelation**: 
+The p-value of Portmanteau Test is `r renderUI(HTML(round(serial.test(mod.VAR.select(), type="PT.asymptotic")$serial$p.value, 3)))`, which implies that there is `r renderUI(HTML(ifelse(serial.test(mod.VAR.select(), type="PT.asymptotic")$serial$p.value < 0.05, " ", "NO")))` statistically significant autocorrelation among the model residuals. The p-value of Breusch-Godfrey LM Test is `r renderUI(HTML(round(serial.test(mod.VAR.select(), type="BG")$serial$p.value, 3)))`, which implies that there is `r renderUI(HTML(ifelse(vars::serial.test(mod.VAR.select(), type="BG")$serial$p.value < 0.05, " ", "NO")))` statistically significant autocorrelation among the model residuals.
+
+- Residual **Heteroskedasticity**: The p-value of ARCH-LM test is `r renderUI(HTML(round(arch.test(mod.VAR.select())$arch.mul$p.value, 3)))`. Hence, there is `r renderUI(HTML(ifelse(arch.test(mod.VAR.select())$arch.mul$p.value < 0.05, " ", "NO ")))` statistically significant heteroskedasticity in the model residuals.
+
+
+- Residuals over time
+```{r}
+renderPlot({
+  tmp <- mod.VAR.select()
+  namVar <- colnames(tmp$y)
+  df.mod.resid <- data.frame(tmp$varresult[[1]]$residuals, stringsAsFactors = F)
+  if (length(namVar > 1)){
+    for (idx in 2:length(namVar)){
+      df.mod.resid <- cbind(df.mod.resid, 
+                           data.frame(tmp$varresult[[idx]]$residuals, stringsAsFactors = F))
+    }
+  }
+  names(df.mod.resid) <- namVar
+  df.mod.resid$date <- tail(df.train.data2VAR.fit()$date, dim(df.mod.resid)[1])
+  eval(parse(text=paste0( 
+    "df2Plot <- df.mod.resid %>%", 
+    "gather(measure, value,", namVar[1], ":", tail(namVar, 1), ")" 
+  )))
+  gObj <- ggplot(data=df2Plot) +
+    geom_point(aes(x=date, y=value, group=measure), col="blue", size=2) +
+    facet_wrap(~measure, scales="free") + 
+    geom_hline(yintercept = 0, col="red")
+  if (nrow(df.UsRecess.train.VAR())==0) {
+    gObj
+  } else{
+    gObj + geom_rect(data=df.UsRecess.train.VAR(),
+            aes(xmin=monBeg, xmax=monEnd, ymin=-Inf, ymax=+Inf), fill='red', alpha=0.2)
+  }
+})
+```
+
+### Residuals ACF
+```{r}
+renderPlot({
+  acf(residuals(mod.VAR.select()))
+})
+```
+
+### Model Forecast
+```{r}
+renderPlot({
+  tmp <- df.VAR.forecast.val2VAR()
+  namDf <- names(tmp)[names(tmp) != "date"]
+  eval(parse(text=paste0(
+  "df2Plot <- tmp %>% ",
+    "gather(measure, value,", namDf[1], ":", tail(namDf, 1), ")"
+  )))
+  pos.char <- unlist(regexec("_", as.character(df2Plot$measure)))
+  df2Plot$variable <- NA
+  df2Plot$type <- NA
+  Check.StopIf(!identical(length(pos.char), dim(df2Plot)[1]), "Must be the same length here!!!")
+  for (idx in 1:dim(df2Plot)[1]){
+   df2Plot$variable[idx] <- substr(as.character(df2Plot$measure[idx]), 1, pos.char[idx]-1)
+   df2Plot$type[idx] <- substr(as.character(df2Plot$measure[idx]), pos.char[idx]+1, nchar(as.character(df2Plot$measure[idx])))
+  }
+  gObj <- ggplot(data = filter(df2Plot, type == "value")) +
+    geom_line(aes(x=date, y=value, group=variable), col="green") +
+    geom_point(aes(x=date, y=value, group=variable), size=2, col="green") +
+    facet_wrap(~variable, scales="free")
+  ## overlay the forecasts and CI
+  gObj <- gObj + geom_line(data=filter(df2Plot, type == "predict"),
+                  aes(x=date, y=value), col="blue") +
+    geom_line(data=filter(df2Plot, type == "LowerB"),
+                  aes(x=date, y=value), col="red", linetype="dotted") +
+    geom_line(data=filter(df2Plot, type == "UpperB"),
+                  aes(x=date, y=value), col="red", linetype="dotted")  #+
+    #facet_wrap(~variable)
+  ## overlay recession period if necessanary
+  if (nrow(df.UsRecess.test.VAR())==0) {
+    gObj
+  } else{
+    gObj + geom_rect(data=df.UsRecess.test.VAR(),
+            aes(xmin=monBeg, xmax=monEnd, ymin=-Inf, ymax=+Inf), fill='red', alpha=0.2)
+  }
+})
+```
+
+
+### Cointegration 
+[Johansen] test is performed to examine existence of conintegration among the chosen time series. Two tests (namely, Trace and Maximum Eigenvalue) are both performed, given the chosen lag of the fitted VAR(p) model.
+``` {r}
+# renderPrint({
+#   #mat.inp <- matrix(, nrow=dim(df.train.data2VAR.fit())[1])
+#   # tst <- attributes(summary(ca.jo(data.matrix(tmp), spec="transitory")))
+#   # # tmp
+#   # class(tst)
+#   # tst
+# })
+```
+
+
+ESG-VAR
+=======================================================================
+
+### VAR(p) Parameters
+```{r}
+fillRow(flex = c(1, NA), 
+  renderUI({
+    tmp <- lst.modEst.VAR.select()
+    vec.def.est <- round(tmp$df.est[, 1], 2)
+    vec.def.est[tmp$df.est.pVal[, 1] > 0.05] <- 0.0
+    vec.def.name <- row.names(tmp$df.est.pVal)
+    lapply(1:length(vec.def.name), function(idx) {
+      numericInput(vec.def.name[idx], label=vec.def.name[idx], value=vec.def.est[idx])
+    })
+})
+)
+
+```

@@ -1,0 +1,517 @@
+---
+title: "ESG Mock"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    #vertical_layout: fill
+    #vertical_layout: scroll
+    social: menu
+    source_code: embed
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+rm(list = ls())
+### load prepare the data or source them from data dictioanry
+load("DATA/usEcoData2Test.Rdata")
+######source("CODE/0_collect_prepare_data.R")
+######source("CODE/0_collect_prepare_CSV.R")
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(flexdashboard)
+source("CODE/fun_generic.R")
+```
+
+Univariate Time Series
+=======================================================================
+
+Inputs {.sidebar}
+-----------------------------------------------------------------------
+
+```{r}
+selectInput("var.name.sel", label = h3("Economic varibale"), 
+  choices = as.character(dict.data$nameR), 
+  selected = as.character(dict.data$nameR[1]))
+### ***2DO following start date and end date should be linked with the chosen variable
+dateRangeInput("dates.train.sel", label = h5("Traning sample date range"),
+      start = "1970-01-01", 
+      end = "2010-12-01")
+```
+HERE we explain the basic ideas, etc etc.
+
+
+
+```{r}
+selectInput("delta.sel", label = h5(paste0("Type of difference")), 
+  choices = list("as-is"="asis", "log difference"="diffLog", "% return"="diffRelat", "absolute difference"="diffAbs"), 
+  selected = "diffLog")
+```
+as-is: $\Delta x_t = x_t$; 
+log diff: $\Delta x_t = \log(x_t)-\log(x_{t-1})$;
+% return: $\Delta x_t = x_t / x_{t_1} - 1$;
+abs diff: $\Delta x_t = x_t - x_{t_1}$;
+
+
+
+```{r}
+sliderInput(inputId = "ar.lag.sel", label = "Autoregressive lag", min = 0, max = 10, value = 1)
+sliderInput(inputId = "df.lag.sel", label = "Differencing lag", min = 0, max = 10, value = 0)
+sliderInput(inputId = "ma.lag.sel", label = "Moving-Average lag", min = 0, max = 10, value = 0)
+```
+
+
+```{r}
+### ***2DO how to interacte training sample date range
+dateRangeInput("dates.test.sel", label = h5("Testing sample date range"),
+      start = "2011-01-01", 
+      end = as.character(Sys.Date()))
+```
+
+```{r}
+#############################BEGIN: Prepare Reactive Data #############################################
+namVarb <- reactive({
+  as.character(input$var.name.sel)
+})
+
+inp.date.beg <- reactive({
+  as.Date(input$dates.train.sel[1])
+})
+
+inp.date.end <- reactive({
+  as.Date(input$dates.train.sel[2])
+})
+
+date.beg.test <- reactive({
+  as.Date(input$dates.test.sel[1])
+})
+
+date.end.test <- reactive({
+  as.Date(input$dates.test.sel[2])
+})
+
+
+df.full.sample <- reactive({
+  Check.StopIf(sum(names(lst.eco)==namVarb())!=1, 
+               "The selected variable cannot be found in the data list. Check dict.data!!!")
+  eval(parse(text=paste0(
+   "tmp <- lst.eco$", namVarb()
+  )))
+  Check.ExistVarInDF(tmp, c("date", "value"))
+  tmp
+})
+
+df.full.sample.delta <- reactive({
+  tmp <- df.full.sample()
+  Check.Unique(tmp$date)
+  Check.StopIf(sum(is.na(tmp$value))>0, "Currently, we cannot handle NA in the eco variable!")
+  if (!identical(sort(tmp$date), tmp$date)){
+    tmp <- tmp[match(sort(tmp$date), tmp$date), ]
+  }
+  if(input$delta.sel == "asis"){
+    res <- tmp
+  } else if (input$delta.sel == "diffLog"){
+    res <- tmp[-1, ]
+    res$value <- log(tmp[-1, 2]) - log(head(tmp[, 2], dim(tmp)[1]-1))
+  } else if (input$delta.sel == "diffRelat"){
+    res <- tmp[-1, ]
+    res$value <- tmp[-1, 2] / head(tmp[, 2], dim(tmp)[1]-1) -1
+  } else if (input$delta.sel == "diffAbs"){
+    res <- tmp[-1, ]
+    res$value <- tmp[-1, 2] - head(tmp[, 2], dim(tmp)[1]-1)
+  } else {
+    stop("The chosen delta is not defined. Extend code here!")
+  }
+  res
+})
+### select the training sample value
+df.eco2Use <- reactive({
+  tmp <- df.full.sample()
+  filter(tmp, date >= max(inp.date.beg(), min(tmp$date)),
+         date <= min(inp.date.end(), max(tmp$date)))
+})
+### select training sample DELTA values
+df.eco2Use.delta <- reactive({
+  tmp <- df.full.sample.delta()
+  filter(tmp, date > min(df.eco2Use()[, 1]),
+         date <= max(df.eco2Use()[, 1]))
+})
+### US Recession stress period for training sample
+df.date.UsRecess <- reactive({
+  filter(dateUsRecess, monBeg >= min(df.eco2Use()[, 1]), monEnd <= max(df.eco2Use()[, 1]))
+})
+### select the testing sample value
+df.test.sample <- reactive({
+  tmp <- df.full.sample()
+  filter(tmp, date >= max(date.beg.test(), min(tmp$date)),
+         date <= min(date.end.test(), max(tmp$date)))
+})
+### select the testing sample delta value
+df.test.sample.delta <- reactive({
+  tmp <- df.full.sample.delta()
+  filter(tmp, date > min(df.test.sample()[, 1]),
+         date <= max(df.test.sample()[, 1]))
+})
+### US Recession stress period for testing sample
+df.date.UsRecess.test <- reactive({
+  filter(dateUsRecess, monBeg >= min(df.test.sample()[, 1]), monEnd <= max(df.test.sample()[, 1]))
+})
+########################################################################END: reactive data##
+
+
+############### ANALYTIC #################
+### 1. Stationarity test for the chosen variable
+## ADF test 
+res.adf.txt <- reactive({
+  as.character(tseries::adf.test(as.numeric(df.eco2Use()$value), "stationary"))
+})
+## Phillips and Perron test
+res.pp.txt <- reactive({
+  as.character(PP.test(as.numeric(df.eco2Use()$value)))
+})
+## KPSS test
+res.kpLevel.txt <- reactive({
+  tseries::kpss.test(as.numeric(df.eco2Use()$value), null="Level")
+})
+res.kpTrend.txt <- reactive({
+  tseries::kpss.test(as.numeric(df.eco2Use()$value), null="Trend")
+})
+### 2. Stationarity test for DELTAs
+## ADF
+res.adf.txt.delta <- reactive({
+  as.character(tseries::adf.test(as.numeric(df.eco2Use.delta()$value), "stationary"))
+})
+## Phillips and Perron test
+res.pp.txt.delta <- reactive({
+  as.character(PP.test(as.numeric(df.eco2Use.delta()$value)))
+})
+## KPSS test
+res.kpLevel.txt.delta <- reactive({
+  tseries::kpss.test(as.numeric(df.eco2Use.delta()$value), null="Level")
+})
+res.kpTrend.txt.delta <- reactive({
+  tseries::kpss.test(as.numeric(df.eco2Use.delta()$value), null="Trend")
+})
+
+mod.arima <- reactive({
+  ar <- input$ar.lag.sel
+  df <- input$df.lag.sel 
+  ma <- input$ma.lag.sel
+  ### quality checks
+  Check.StopIf(max(c(ar, df, ma)) > (dim(df.eco2Use.delta())[1]+1), 
+               "Chosen lag should be smaller than time series length!")
+  arima(df.eco2Use.delta()$value, order = c(ar, df, ma))
+})
+
+df.arima.predict <- reactive({
+  tmp.val <- df.test.sample()
+  tmp.val$value <- as.numeric(tmp.val$value)
+  tmp.delta <- df.test.sample.delta()
+  tmp.delta.pred <- predict(mod.arima(), n.ahead=dim(tmp.delta)[1])
+  df.pred.delta <- data.frame(date=tmp.delta$date, value=tmp.delta$value,
+                              pred=as.numeric(tmp.delta.pred$pred), se=as.numeric(tmp.delta.pred$se))
+  ### quality checks
+  mapDe2Val <- match(tmp.val$date[-1], df.pred.delta$date)
+  Check.StopIf(sum(is.na(mapDe2Val))>0, "Expect that delta dates should be all found")
+  Check.Unique(mapDe2Val)
+  df.pred.val <- tmp.val
+  if(input$delta.sel == "asis"){ ##### 2DO: bug here! as-is does not work
+    df.pred.val$pred <- c(df.pred.val$value[1], df.pred.delta$pred[mapDe2Val])
+    df.pred.val$se <- c(df.pred.val$value[1], df.pred.delta$se[mapDe2Val])
+  } else if (input$delta.sel == "diffLog"){
+    df.pred.val$pred <- exp(cumsum(c(log(df.pred.val$value[1]), df.pred.delta$pred[mapDe2Val])))
+    df.pred.val$se <- exp(cumsum(c(log(df.pred.val$value[1]), df.pred.delta$se[mapDe2Val])))
+  } else if (input$delta.sel == "diffRelat"){
+    df.pred.val$pred <- df.pred.val$value[1]*cumprod(1+c(0, df.pred.delta$pred[mapDe2Val]))
+    df.pred.val$se <- df.pred.val$value[1]*cumprod(1+c(0, df.pred.delta$se[mapDe2Val]))
+  } else if (input$delta.sel == "diffAbs"){
+    df.pred.val$pred <- cumsum(c(df.pred.val$value[1], df.pred.delta$pred[mapDe2Val]))
+    df.pred.val$se <- cumsum(c(df.pred.val$value[1], df.pred.delta$se[mapDe2Val]))
+  } else {
+    stop("The chosen delta is not defined. Extend code here!")
+  }
+  list(df.pred.delta=df.pred.delta, df.pred.val=df.pred.val)
+})
+
+### Residual stationary test results
+## ADF test 
+resid.adf.txt <- reactive({
+  as.character(tseries::adf.test(as.numeric(mod.arima()$residuals), "stationary"))
+})
+## Phillips and Perron test
+resid.pp.txt <- reactive({
+  as.character(PP.test(as.numeric(mod.arima()$residuals)))
+})
+## KPSS test
+resid.kpLevel.txt <- reactive({
+  tseries::kpss.test(as.numeric(mod.arima()$residuals), null="Level")
+})
+resid.kpTrend.txt <- reactive({
+  tseries::kpss.test(as.numeric(mod.arima()$residuals), null="Trend")
+})
+#########################################
+```
+
+
+
+Row {.tabset .tabset-fade}
+-----------------------------------------------------------------------
+### Plot of chosen variable
+```{r}
+#########PLOT over time
+renderPlot({
+    ggplot(df.eco2Use()) + 
+    geom_line(aes(x=date, y=value), col="blue", size=2) + theme_bw()  + 
+    geom_rect(data=df.date.UsRecess(), 
+              aes(xmin=monBeg, xmax=monEnd, ymin=-Inf, ymax=+Inf), fill='red', alpha=0.2)
+})
+```
+
+### Plot $\Delta$ 
+```{r}
+renderPlot({
+  #par(mfrow=c(1,2))
+  ### left plot
+  ggplot(df.eco2Use.delta()) +
+  geom_line(aes(x=date, y=value), col="blue", size=1) + theme_bw() +
+  geom_rect(data=df.date.UsRecess(),
+            aes(xmin=monBeg, xmax=monEnd, ymin=-Inf, ymax=+Inf), fill='red', alpha=0.2)
+  ### right plot
+  # ggplot(df.eco2Use.delta(), aes(x=value)) + 
+  #   geom_histogram()
+  #par(mfrow=c(1,1))
+})
+```
+
+
+### Histogram $\Delta$
+```{r}
+renderPlot({
+  ggplot(df.eco2Use.delta(), aes(x=value)) +
+    geom_histogram(aes(y=..density..), fill="green", alpha=0.5) +
+    geom_density(col="blue", size=1) +
+    stat_function(fun=dnorm, args=list(mean=mean(df.eco2Use.delta()$value), sd=sd(df.eco2Use.delta()$value)), 
+                  col="red", size=1) +
+    scale_colour_manual(name = "", values = c("blue", "red"), 
+                               breaks = c("bla", "blabla", "yada"), 
+                               labels = c("kernel_est", "empirical density", "normal density")) +
+    theme(legend.position="bottom") 
+    #scale_fill_discrete(name="Type: ", labels=c("delta values", "Normal density")) + 
+    #theme(legend.position="bottom") 
+    ### ***2DO: fix the legend here!!!
+})
+```
+
+
+
+### ACF $\Delta$
+[**ACF**: correlation between values of the chosen variable at different time](https://en.wikipedia.org/wiki/Autocorrelation)
+
+```{r}
+### get ACF plot
+renderPlot({
+  acf.res <- acf(df.eco2Use.delta()$value, plot = F)
+  plot(acf.res, main = "")
+})
+```
+
+### PCF $\Delta$
+[**PACF**: partial correlation between values of the chosen variable at different time](https://en.wikipedia.org/wiki/Partial_autocorrelation_function)
+
+```{r}
+### get ACF plot
+renderPlot({
+  pacf.res <- pacf(df.eco2Use.delta()$value, plot = F)
+  plot(pacf.res, main = "")
+})
+```
+
+
+### Stationarity 
+
+#### Stationarity test on the chosen variable and its **$\Delta$**
+
+- [ADF](https://en.wikipedia.org/wiki/Augmented_Dickey%E2%80%93Fuller_test) test ($H_0$ of unit root presence, i.e.,  $I(1)$ process vs. $H_A$ stationary)
+
+- [PP](https://en.wikipedia.org/wiki/Augmented_Dickey%E2%80%93Fuller_test) test ($H_0$ of unit root presence, i.e.,  $I(1)$ process v.s., $H_A$ stationary)
+
+- [KPSS](https://en.wikipedia.org/wiki/KPSS_test) test ($H_0$ of stationary or $I(0)$ process v.s. $H_A$ non-stationary): 
+This test can be performed assuming the deterministic component of the variable is a constant or a constant with a linear trend.
+
+```{r}
+DT::renderDataTable({
+  tab2Show <- data.frame(pVal.var=as.numeric(c(res.adf.txt()[4], res.pp.txt()[3],
+                                         res.kpLevel.txt()[3], res.kpTrend.txt()[3])),
+                         pVal.delta=as.numeric(c(res.adf.txt.delta()[4], res.pp.txt.delta()[3],
+                                         res.kpLevel.txt.delta()[3], res.kpTrend.txt.delta()[3])),
+                         stat.var = as.numeric(c(res.adf.txt()[1], res.pp.txt()[1],
+                                         res.kpLevel.txt()[1], res.kpTrend.txt()[1])),
+                         stat.delta=as.numeric(c(res.adf.txt.delta()[1], res.pp.txt.delta()[1],
+                                         res.kpLevel.txt.delta()[1], res.kpTrend.txt.delta()[1])),
+                         stringsAsFactors=FALSE)
+  tab2Show <- tab2Show %>%
+    mutate(test = c("ADF test", "PP test", "KPSS: constant", "KPSS: trend"),
+           conclusion.var=ifelse(grepl("KPSS", test),
+                             ifelse(pVal.var >= 0.05, "Stationary", "Not stationary"),
+                             ifelse(pVal.var < 0.05, "Stationary", "Not stationary")),
+           conclusion.delta=ifelse(grepl("KPSS", test),
+                             ifelse(pVal.delta >= 0.05, "Stationary", "Not stationary"),
+                             ifelse(pVal.delta < 0.05, "Stationary", "Not stationary")),
+           pVal.var=round(pVal.var, 3), pVal.delta=round(pVal.delta, 3))
+  tab2Show <- select(tab2Show, test, pVal.var, conclusion.var,  pVal.delta, conclusion.delta)
+  names(tab2Show) <- c("Stationary tests", "varible: p-value", "variable: Conclusion",
+                       "delta: p-value", "delta: Conclusion")
+  tab2Show
+},  options=list(dom = 't'), rownames = FALSE)
+```
+
+
+Row {.tabset .tabset-fade}
+-----------------------------------------------------------------------
+### ARIMA Fit on $\Delta$
+- The ARIMA fit results are:
+`r renderUI(HTML(gsub(" ", " ", paste(capture.output(mod.arima())[-c(1:4)], collapse = " <br/>"))))`
+
+- Historical fit of the above model is:
+```{r}
+renderPlot({
+    # fit.pred.res <- mod.arima()$residuals + as.numeric(df.eco2Use.delta()$value)
+    # plot(df.eco2Use.delta()$date, df.eco2Use.delta()$value, col = "blue")
+    # lines(df.eco2Use.delta()$date, fit.pred.res, col = "red", 
+    #       ylim=c(min(fit.pred.res), max(fit.pred.res)))
+  tmp <- data.frame(date=df.eco2Use.delta()$date, 
+                    value=mod.arima()$residuals + as.numeric(df.eco2Use.delta()$value))
+  ggplot(data=df.eco2Use.delta(), aes(x=date, y=value)) + 
+    geom_line(col="blue", size=1, alpha=0.9) +
+    geom_line(data=tmp, aes(x=date, y=value), col="red")
+  })
+```
+
+- Diagnostic Overview 
+```{r}
+### get ACF plot
+renderPlot({
+  tsdiag(mod.arima())
+}) #, height = 400, width = 600 
+```
+
+- Residual PACF plot
+```{r}
+### get PACF plot
+renderPlot({
+  pacf.res <- pacf(mod.arima()$residuals, plot = F)
+  plot(pacf.res, main = "PACF plot of fitted model residuals")
+})
+```
+
+### Residual plots 
+Residual plot (over time) of the above model is:
+```{r}
+renderPlot({
+  tmp <- data.frame(date=df.eco2Use.delta()$date, residuals=as.numeric(mod.arima()$residuals))
+  ggplot(tmp, aes(x=date, y=residuals)) + 
+    geom_point(col="blue", size=2) +
+    geom_hline(yintercept = 0, col="red")
+})
+```
+
+
+### Residual Normality
+- QQ plot of residuals 
+```{r}
+### ***2D: add confidence iternvals
+renderPlot({
+  tmp <- data.frame(residuals=as.numeric(mod.arima()$residuals))
+  ggplot(data=as.data.frame(qqnorm(tmp$residuals, plot=FALSE)), aes(x=x, y=y)) + 
+    geom_point(size=2, col="blue") + 
+    geom_smooth(method="lm", se=FALSE, col="red") + 
+    scale_x_continuous(name="Theoretical quantiles") + 
+    scale_y_continuous(name="Sample quantiles")
+  # ggplot(tmp, aes(sample = residuals)) + 
+  #   stat_qq(shape=1) 
+  })
+```
+
+
+### Residual test
+#### Stationary tests on residuals
+```{r}
+DT::renderDataTable({
+  tab2Show <- data.frame(pVal.var=as.numeric(c(resid.adf.txt()[4], resid.pp.txt()[3], 
+                                         resid.kpLevel.txt()[3], resid.kpTrend.txt()[3])),
+                         stringsAsFactors=FALSE)
+  tab2Show <- tab2Show %>%
+    mutate(test = c("ADF test", "PP test", "KPSS: constant", "KPSS: trend"),
+           conclusion.var=ifelse(grepl("KPSS", test), 
+                             ifelse(pVal.var >= 0.05, "Stationary", "Not stationary"), 
+                             ifelse(pVal.var < 0.05, "Stationary", "Not stationary")))
+  tab2Show[, grepl("pVal", names(tab2Show))] <- round(tab2Show[, grepl("pVal", names(tab2Show))], 3)
+  tab2Show <- select(tab2Show, test, pVal.var, conclusion.var)
+  names(tab2Show) <- c("Stationary tests", "p-value", "Conclusion")
+  tab2Show
+},  options=list(dom = 't'), rownames = FALSE)
+```
+
+#### [Ljung-Box](http://en.wikipedia.org/wiki/Ljung%E2%80%93Box_test) test on residual randomness: 
+
+- **Test hypothesis**: $H_0$ that residulas are not auto-correlated (i.e. the correlations in the population from which the sample is taken are 0, so that any observed correlations in the data result from randomness of the sampling process), v.s., $H_A$ that the residulas process statistically significant autocorrelation.
+
+- **Statistics**: Ljung-Box test statistic of the residuals is `r renderUI(HTML(paste0(round(as.matrix(Box.test(mod.arima()$residuals, type="Ljung-Box")$statistic), 3), "")))` and the associated p-value is `r renderUI(HTML(paste0(round(as.matrix(Box.test(mod.arima()$residuals, type = "Ljung-Box")$p.value), 2), "")))`
+
+```{r}
+renderUI({
+  res <- as.numeric(as.matrix(Box.test(mod.arima()$residuals, type = "Ljung-Box")$p.value))
+  if(res >= 0.05){
+    txt <- "Hence, the residuals of the fitted model exhibits statistically significant randomness"
+  } else {
+    txt <- "Hence, the residuals of the fitted model are NOT statistically-significant independently distributed."
+  }
+  HTML(paste0(txt, ""))
+})
+```
+
+
+### Forecast $\Delta$
+```{r}
+#### Figure of forecast delta
+renderPlot({
+  df2Plot <- df.arima.predict()$df.pred.delta
+  gObj <- ggplot(df2Plot) +
+    geom_point(aes(x=date, y=value), col="blue", size=3, alpha=0.8)  +
+    geom_line(data=df2Plot, aes(x=date, y=pred), col="black") +
+    geom_point(data=df2Plot, aes(x=date, y=pred), col="black", size=3, alpha=0.5) +
+    geom_line(data=df2Plot, aes(x=date, y=pred+2*se), col="red", size=1) +
+    geom_line(data=df2Plot, aes(x=date, y=pred-2*se), col="red", size=1)
+  if (nrow(df.date.UsRecess.test())==0) {
+    gObj
+  } else{
+    gObj + geom_rect(data=df.date.UsRecess.test(),
+            aes(xmin=monBeg, xmax=monEnd, ymin=-Inf, ymax=+Inf), fill='red', alpha=0.2)
+  }
+})
+```
+
+
+### Forecast Variable
+```{r}
+#### Figure of variable value 
+renderPlot({
+  df2Plot <- df.arima.predict()$df.pred.val
+  gObj <- ggplot(df2Plot) + 
+    geom_point(aes(x=date, y=value), col="blue", size=3, alpha=0.8)  +
+    geom_line(data=df2Plot, aes(x=date, y=pred), col="black") +
+    geom_point(data=df2Plot, aes(x=date, y=pred), col="black", size=3, alpha=0.5) 
+  if (nrow(df.date.UsRecess.test())==0) {
+    gObj
+  } else{
+    gObj + geom_rect(data=df.date.UsRecess.test(),
+            aes(xmin=monBeg, xmax=monEnd, ymin=-Inf, ymax=+Inf), fill='red', alpha=0.2)
+  }
+})
+```
+
+Multivariate Time Series
+=======================================================================
+
+Inputs {.sidebar}
+-----------------------------------------------------------------------
