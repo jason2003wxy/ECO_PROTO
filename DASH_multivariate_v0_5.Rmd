@@ -62,8 +62,8 @@ selectInput("delta.sel.VAR", label = h5(paste0("Type of difference / delta")),
   selected = "diffLogAbs")
 ### type of value to VAR(p)
 selectInput("data2Fit.sel.VAR", label = paste0("Type of value for VAR(p) model fit"),
-  choices = list("Original values"="valOriginal", "Adjusted values based chosen delta (log value if log diff)"="valAjusted", 
-                 "Delta value directly"="valDelta"), selected = "valAjusted")
+  choices = list("Original values"="valOriginal"), # "Adjusted values based chosen delta (log value if log diff)"="valAjusted", "log of original values"="valLogOrg"), 
+  selected = "valOriginal")
 ### lag for VAR(p) model fitting
 sliderInput(inputId = "sel.VAR.lag", label = "p parameter: lag of VAR(p)", min = 0, max = 10, value = 1)
 ### ***2DO how to interacte training sample date range
@@ -154,7 +154,6 @@ df.full.sample.delta.VAR <- reactive({
   }
   res
 })
-
 ## traning sample according to the selected economic variables
 df.train.sample.VAR <- reactive({
   tmp <- df.full.sample.VAR()
@@ -190,22 +189,23 @@ df.train.sample.delta.VAR <- reactive({
 df.train.data2VAR.fit <- reactive({
   if (input$data2Fit.sel.VAR == "valOriginal"){
     res <- df.train.sample.VAR()
-  } else if (input$data2Fit.sel.VAR == "valDelta"){
-    res <- df.train.sample.delta.VAR()
   } else if (input$data2Fit.sel.VAR == "valAjusted") {
     tmp <- df.train.sample.VAR()
     if (sum(input$delta.sel.VAR %in% c("asis", "diffAbs"))==1) {
-      res <- tmp
+        res <- tmp
     } else if (input$delta.sel.VAR == "diffLogAbs") {
-      ixNonRest <- (!grepl("rate.", names(tmp), ignore.case=T)) & (names(tmp) != "date")
-      res <- tmp
-      res[, ixNonRest] <- log(res[, ixNonRest])
+        ixNonRest <- (!grepl("rate.", names(tmp), ignore.case=T)) & (names(tmp) != "date")
+        res <- tmp
+        res[, ixNonRest] <- log(res[, ixNonRest])
     } else if (input$delta.sel.VAR == "diffLog") {
-      res <- tmp
-      res[, names(tmp) != "date"] <- log(tmp[, names(tmp) != "date"])
+        res <- tmp
+        res[, names(tmp) != "date"] <- log(tmp[, names(tmp) != "date"])
     } else{
-      stop("It is not defined here!!!")
+        stop("It is not defined here!!!")
     }
+  } else if (input$data2Fit.sel.VAR == "valLogOrg"){
+    res <- df.train.sample.VAR()
+    res[, names(res) != "date"] <- log(res[, names(res) != "date"])
   } else {
     stop("Expand code for this case!!!")
   }
@@ -233,8 +233,6 @@ df.test.sample.delta.VAR <- reactive({
 df.test.data2VAR.fit <- reactive({
   if (input$data2Fit.sel.VAR == "valOriginal"){
     res <- df.test.sample.VAR()
-  } else if (input$data2Fit.sel.VAR == "valDelta"){
-    res <- df.test.sample.delta.VAR()
   } else if (input$data2Fit.sel.VAR == "valAjusted") {
     tmp <- df.test.sample.VAR()
     if (sum(input$delta.sel.VAR %in% c("asis", "diffAbs"))==1) {
@@ -249,6 +247,9 @@ df.test.data2VAR.fit <- reactive({
     } else{
       stop("It is not defined here!!!")
     }
+  } else if (input$data2Fit.sel.VAR == "valLogOrg"){
+    res <- df.test.sample.VAR()
+    res[, names(res) != "date"] <- log(res[, names(res) != "date"])
   } else {
     stop("Expand code for this case!!!")
   }
@@ -479,7 +480,7 @@ renderPrint({
 })
 ```
 
-- VAR(p) model fit given chosen p value
+- VAR(p) model fit given chosen p lag
 ```{r}
 DT::renderDataTable({
   tmp <- lst.modEst.VAR.select()
@@ -523,7 +524,7 @@ DT::renderDataTable({
   }
   names(tab2Show) <- c("Granger p-value", "Granger Null hypothesis", "Instant p-value", "Instant Null hypothesis")
   tab2Show
-  }, options = list(pageLength = 1, autoWidth = TRUE)
+  }, options = list(pageLength = 1, autoWidth = TRUE), rownames = FALSE
 )
 ```
 
@@ -657,17 +658,19 @@ renderPlot({
    df2Plot$variable[idx] <- substr(as.character(df2Plot$measure[idx]), 1, pos.char[idx]-1)
    df2Plot$type[idx] <- substr(as.character(df2Plot$measure[idx]), pos.char[idx]+1, nchar(as.character(df2Plot$measure[idx])))
   }
+  ## DF contains model prediction and UB and LB of confi interval
+  df2Ribbon <- df2Plot[, names(df2Plot) != "measure"] %>% # select(-measure) %>%  #!!! does not work
+    filter(type != "value") %>% 
+    spread(type, value)
+  ## plot test sample
   gObj <- ggplot(data = filter(df2Plot, type == "value")) +
     geom_line(aes(x=date, y=value, group=variable), col="green") +
     geom_point(aes(x=date, y=value, group=variable), size=2, col="green") +
     facet_wrap(~variable, scales="free")
-  ## overlay the forecasts and CI
-  gObj <- gObj + geom_line(data=filter(df2Plot, type == "predict"),
-                  aes(x=date, y=value), col="blue") +
-    geom_line(data=filter(df2Plot, type == "LowerB"),
-                  aes(x=date, y=value), col="red", linetype="dotted") +
-    geom_line(data=filter(df2Plot, type == "UpperB"),
-                  aes(x=date, y=value), col="red", linetype="dotted")  #+
+  ## overlay the forecasts and CI 
+  gObj <- gObj + geom_line(data=df2Ribbon, aes(x=date, y=predict), col="blue") +
+    geom_point(data=df2Ribbon, aes(x=date, y=predict), col="blue", size=2) + 
+    geom_ribbon(data=df2Ribbon, aes(x=date, ymin = LowerB, ymax = UpperB), fill = "grey70", alpha=0.6)   #+
     #facet_wrap(~variable)
   ## overlay recession period if necessanary
   if (nrow(df.UsRecess.test.VAR())==0) {
@@ -691,6 +694,8 @@ renderPlot({
 #   # tst
 # })
 ```
+
+
 
 ESG-VAR
 =======================================================================
@@ -867,5 +872,15 @@ output$barTest <- renderPlot({
     geom_density(col="red", size=1.1, alpha=0.6) +
     facet_wrap(~Variable, scales="free")
   #plotly(gObj_bar)
+})
+```
+
+
+### VAR sim verification
+
+```{r}
+### Verification for lag of 1
+renderPrint({
+  summary(VAR(df_sim_VAR()[1, ], p=input$sel.VAR.lag, type="both"))
 })
 ```
